@@ -314,19 +314,23 @@ def scrub_emails(data):
 def section_1_new_publishers(doc, data):
     add_heading(doc, "一、本期新增 Publisher 列表", level=1)
     summary = data["section1_summary"]
+    us_count = summary.get("us_count", 0)
+    total_count = summary.get("total_count", us_count)
+    by_type = summary.get("by_type", [])
+    top_type_share = by_type[0][2] if by_type else "—"
     add_para(doc,
-             f"过去 30 天内 OUFER JEWELRY US共新增 {summary['total_count']} 家 Publisher，"
-             f"其中 US 站 {summary['us_count']} 家、EU 站 {summary['eu_count']} 家。"
-             f"渠道结构以 Coupon / 优惠码（{summary['by_type'][0][2]}）为绝对主导，"
+             f"过去 30 天内 OUFER JEWELRY US 共新增 {total_count} 家 Publisher（US 站 {us_count} 家）。"
+             f"渠道结构以 Coupon / 优惠码（{top_type_share}）为主导，"
              f"Editorial 内容评测与 Cashback 返现各占约 16-17%，符合 OUFER JEWELRY 珠宝品类典型流量结构。",
              size=10, color=GREY)
 
-    add_heading(doc, "1.1 Publisher 类型分布", level=2)
-    add_table(doc,
-              ["Publisher 类型", "新增家数", "占比"],
-              summary["by_type"],
-              widths_cm=[9.0, 4.0, 4.0],
-              accent_first_col=True)
+    if by_type:
+        add_heading(doc, "1.1 Publisher 类型分布", level=2)
+        add_table(doc,
+                  ["Publisher 类型", "新增家数", "占比"],
+                  by_type,
+                  widths_cm=[9.0, 4.0, 4.0],
+                  accent_first_col=True)
 
     add_heading(doc, "1.2 30 家新增 Publisher 明细", level=2)
     add_table(doc,
@@ -660,9 +664,12 @@ def build_html(data, out_path, embed_images=True):
     # Section 1
     parts.append('<section class="section">')
     parts.append("<h2>一、本期新增 Publisher 列表</h2>")
-    parts.append(f'<p class="lede">过去 30 天内 OUFER JEWELRY US共新增 {summary["total_count"]} 家 Publisher，'
-                 f'其中 US 站 {summary["us_count"]} 家、EU 站 {summary["eu_count"]} 家。'
-                 f'渠道结构以 Coupon / 优惠码（{summary["by_type"][0][2]}）为绝对主导，'
+    _us = summary.get("us_count", 0)
+    _total = summary.get("total_count", _us)
+    _by_type = summary.get("by_type", [])
+    _top_share = _by_type[0][2] if _by_type else "—"
+    parts.append(f'<p class="lede">过去 30 天内 OUFER JEWELRY US 共新增 {_total} 家 Publisher（US 站 {_us} 家）。'
+                 f'渠道结构以 Coupon / 优惠码（{_top_share}）为主导，'
                  f'Editorial 内容评测与 Cashback 返现各占约 16-17%，符合 OUFER JEWELRY 珠宝品类典型流量结构。</p>')
     parts.append("<h3>1.1 Publisher 类型分布</h3>")
     parts.append(_html_table(["Publisher 类型", "新增家数", "占比"], summary["by_type"], accent_first_col=True))
