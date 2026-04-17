@@ -33,10 +33,14 @@ REPORT_DATE="$(date +%F)"
 SKIP_VERCEL=0
 SKIP_GITHUB=0
 DATA_FILE="output/oufer_simple_data.json"
+EMAIL_INTEL_FILE="output/oufer_email_intel.json"
+SCRUB=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --date) REPORT_DATE="$2"; shift 2 ;;
     --data) DATA_FILE="$2"; shift 2 ;;
+    --email-intel) EMAIL_INTEL_FILE="$2"; shift 2 ;;
+    --scrub) SCRUB=1; shift ;;
     --skip-vercel) SKIP_VERCEL=1; shift ;;
     --skip-github) SKIP_GITHUB=1; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
@@ -64,10 +68,16 @@ echo ""
 echo "▸ [1/4] Rendering DOCX + HTML + PDF + Markdown..."
 OBSIDIAN_ARG=()
 [ -n "${OBSIDIAN_DIR:-}" ] && OBSIDIAN_ARG=(--obsidian-dir "$OBSIDIAN_DIR")
+INTEL_ARG=()
+[ -f "$EMAIL_INTEL_FILE" ] && INTEL_ARG=(--email-intel "$EMAIL_INTEL_FILE")
+SCRUB_ARG=()
+[ "$SCRUB" -eq 1 ] && SCRUB_ARG=(--scrub)
 python3 scripts/generate_simple_report.py \
   --data "$DATA_FILE" \
   --out-dir "$OUTPUT_DIR" \
   --date "$REPORT_DATE" \
+  "${INTEL_ARG[@]}" \
+  "${SCRUB_ARG[@]}" \
   "${OBSIDIAN_ARG[@]}"
 
 DOCX="${OUTPUT_DIR}/${BASE}.docx"
@@ -104,6 +114,14 @@ if [ $SKIP_GITHUB -eq 0 ]; then
     src="${SKILL_ROOT}/output/${img}.png"
     [ -f "$src" ] && cp "$src" "$TARGET/attachments/"
   done
+
+  # Copy Gmail-scraped attachments (IOs, SoWs, contracts, brand assets)
+  if [ -d "${SKILL_ROOT}/output/attachments" ]; then
+    find "${SKILL_ROOT}/output/attachments" -maxdepth 1 -type f -print0 | \
+      xargs -0 -I{} cp "{}" "$TARGET/attachments/" 2>/dev/null || true
+    att_count=$(find "$TARGET/attachments" -maxdepth 1 -type f | wc -l | tr -d ' ')
+    echo "  · copied $att_count attachment(s) into reports/${REPORT_DATE}/attachments/"
+  fi
 
   git -C "$REPO_DIR" add -A
   if git -C "$REPO_DIR" diff --cached --quiet; then

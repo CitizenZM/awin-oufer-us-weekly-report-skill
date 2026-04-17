@@ -288,10 +288,13 @@ def new_section(doc, orientation="portrait"):
 
 # --------------------------- Privacy: scrub data once ---------------------------
 def scrub_emails(data):
-    """Drop email column from section4_emails; mask any other accidental emails."""
+    """Drop email column from section4_emails; mask any other accidental emails.
+
+    NOTE: this is OFF by default for brand-ops weekly reports (delivered to Oufer/Rockbros
+    brand-side ops team behind SSO). Opt-in via `--scrub` on CLI when a public/external
+    audience is in scope.
+    """
     out = json.loads(json.dumps(data))  # deep copy
-    # section4_emails: original schema = [name, email, subject, type, last, status, requested]
-    # New schema (no email): [name, subject, type, last, status, requested]
     new_rows = []
     for row in out.get("section4_emails", []):
         if len(row) == 7:
@@ -300,13 +303,109 @@ def scrub_emails(data):
         else:
             new_rows.append([mask_email(c) for c in row])
     out["section4_emails"] = new_rows
-    # Catch any stray emails in other free-text fields
-    for key in ("section4_todo", "section5_brand_actions", "section4_assets"):
+    for key in ("section4_todo", "section5_brand_actions", "section4_assets",
+                "section4_shipping", "section4_contracts"):
         if key in out:
             out[key] = [[mask_email(c) for c in row] for row in out[key]]
     for key in ("section2_diagnosis", "section3_diagnosis", "section5_summary"):
         if key in out and isinstance(out[key], str):
             out[key] = mask_email(out[key])
+    return out
+
+
+# --------------------------- Gmail intel merge (optional) ---------------------------
+def _slug(s):
+    return "".join(c if c.isalnum() else "-" for c in (s or "")).strip("-").lower() or "thread"
+
+
+def merge_email_intel(data, intel_path, attachment_url_prefix="attachments"):
+    """Merge oufer_email_intel.json (produced by Gmail MCP scrape) into section4_*.
+
+    Derives four tables from intel.threads[]:
+      - section4_emails     — every relevant thread, with raw contact info
+      - section4_shipping   — intel_type=sample_ship
+      - section4_contracts  — intel_type=paid_placement
+      - section4_assets     — intel_type=asset_request (merged with any pre-existing hand-curated rows)
+
+    `attachment_url_prefix` is a relative path used for hyperlinks inside HTML
+    (resolves to reports/{date}/attachments/{file} once publish.sh copies it).
+
+    If `intel_path` does not exist, returns data unchanged — the skill can still render
+    from hand-curated section4_* arrays.
+    """
+    p = Path(intel_path).expanduser()
+    if not p.exists():
+        return data
+
+    intel = json.loads(p.read_text(encoding="utf-8"))
+    threads = intel.get("threads", [])
+    if not threads:
+        return data
+
+    out = json.loads(json.dumps(data))
+
+    emails = []
+    shipping = []
+    contracts = []
+    asset_reqs = []
+
+    for t in threads:
+        pub = t.get("publisher", "—")
+        contact = t.get("contact_name") or "—"
+        cemail = t.get("contact_email") or "—"
+        subj = t.get("subject", "—")
+        itype = t.get("intel_type", "—")
+        last = t.get("last_activity", "—")
+        status = t.get("status", "—")
+        notes = t.get("notes_zh", "")
+
+        # 4.1 summary row — keep RAW contact email (brand-ops audience)
+        atts = t.get("attachments") or []
+        att_str = ", ".join(atts) if atts else "—"
+        emails.append([pub, contact, cemail, subj, itype, last, status, att_str])
+
+        if itype == "sample_ship":
+            shipping.append([
+                pub,
+                contact,
+                cemail,
+                t.get("shipping_address", "—"),
+                t.get("requested_skus", "—"),
+                str(t.get("requested_quantity", "—")),
+                t.get("deadline", "—"),
+            ])
+
+        if itype == "paid_placement":
+            doc_name = t.get("contract_doc") or (atts[0] if atts else "—")
+            doc_type = t.get("contract_doc_type", "—")
+            signed = t.get("last_activity", "—")
+            value = t.get("contract_value_usd") or "—"
+            # link is relative; HTML builder turns it into <a>; DOCX shows as plain text
+            link = f"{attachment_url_prefix}/{doc_name}" if doc_name != "—" else "—"
+            contracts.append([pub, contact, doc_name, doc_type, signed, value, link])
+
+        if itype == "asset_request":
+            for att in (atts or ["—"]):
+                asset_reqs.append([att, "文件", pub, "邮件附件已收集" if att != "—" else "待 Publisher 提供"])
+
+    # Merge hand-curated rows with derived rows (keep hand-curated first)
+    if emails:
+        out["section4_emails"] = emails
+    if shipping:
+        out["section4_shipping"] = shipping
+    if contracts:
+        out["section4_contracts"] = contracts
+    if asset_reqs:
+        header = out.get("section4_assets", [["素材名称", "类型", "适用 Publisher", "获取状态"]])[0]
+        body = out.get("section4_assets", [[]])[1:] + asset_reqs
+        out["section4_assets"] = [header] + body
+
+    out["_email_intel"] = {
+        "scrape_date": intel.get("scrape_date"),
+        "thread_count_total": intel.get("thread_count_total"),
+        "thread_count_relevant": intel.get("thread_count_relevant"),
+        "attachment_url_prefix": attachment_url_prefix,
+    }
     return out
 
 
@@ -394,43 +493,99 @@ def section_3_top_publishers(doc, data):
 
 
 def section_4_emails(doc, data):
-    """LANDSCAPE — wider tables. Email column already removed by scrub_emails()."""
+    """LANDSCAPE — brand-ops audience, raw contacts preserved.
+
+    Renders four sub-tables:
+      4.1 合作请求邮件总览      (8 cols — Publisher / Contact / Email / Subject / Type / Last / Status / Attachments)
+      4.2 寄样地址簿            (7 cols — Publisher / Contact / Email / Address / SKUs / Qty / Deadline)
+      4.3 Paid Placement 合同索引 (7 cols — Publisher / Contact / Doc / Type / Signed / Value / Link)
+      4.4 TODO 清单
+      4.5 配套素材需求
+    """
     new_section(doc, orientation="landscape")
     add_heading(doc, "四、Publisher 合作请求邮件追溯（过去 30 天）", level=1)
-    add_para(doc,
-             "本节基于联盟营销邮箱过去 30 天往来邮件梳理，共识别出 9 个与 OUFER JEWELRY 直接相关的"
-             "Publisher 合作 / Integration / Collaboration 请求，并据此拆解为 10 项可执行 TODO 与"
-             "8 项配套素材文件需求。"
-             "为保护合作伙伴隐私，本节已脱敏处理 — 不外露 Publisher 联系邮箱；如需联络方式请向"
-             "联盟营销绩效办公室申请内部清单。",
-             size=10, color=GREY)
 
-    add_heading(doc, "4.1 合作请求邮件清单（脱敏版）", level=2)
-    add_table(doc,
-              ["Publisher", "邮件主题", "合作类型", "最后往来", "当前状态", "请求素材 / 资料"],
-              data["section4_emails"],
-              widths_cm=[4.5, 5.5, 3.5, 2.0, 4.0, 6.0],
-              accent_first_col=True)
+    intel = data.get("_email_intel") or {}
+    scrape_date = intel.get("scrape_date") or data.get("report_date", "—")
+    total = intel.get("thread_count_total")
+    relevant = intel.get("thread_count_relevant")
+    rows_count = len(data.get("section4_emails", []))
+    prose = (
+        f"本节基于品牌方联盟营销邮箱（affiliate@celldigital.co）过去 30 天往来邮件梳理。"
+        f"共扫描 {total if total is not None else '—'} 个邮件线程，识别出 {relevant if relevant is not None else rows_count} "
+        f"个与 OUFER JEWELRY 直接相关的合作线程，按 4 类情报（寄样 / Paid Placement / 素材 / Onboarding）拆解。"
+        "本报告定向派送至品牌侧联盟营销运营团队（SSO 门控），保留 Publisher 真实联系人与邮箱以便品牌团队直接执行寄样、签约、对公打款等动作。"
+    )
+    add_para(doc, prose, size=10, color=GREY)
 
-    add_heading(doc, "4.2 拆解后的 TODO 清单（按优先级）", level=2)
+    # 4.1 summary (8 cols)
+    add_heading(doc, "4.1 合作请求邮件总览", level=2)
+    emails = data.get("section4_emails", [])
+    if emails and len(emails[0]) == 8:
+        add_table(doc,
+                  ["Publisher", "联系人", "Email", "邮件主题", "类型", "最后往来", "状态", "附件"],
+                  emails,
+                  widths_cm=[3.5, 2.8, 4.2, 5.2, 2.8, 2.0, 2.2, 3.0],
+                  accent_first_col=True,
+                  header_size=9, body_size=8)
+    else:
+        # legacy 6-col schema (hand-curated, no Gmail intel merged yet)
+        add_table(doc,
+                  ["Publisher", "邮件主题", "合作类型", "最后往来", "当前状态", "请求素材 / 资料"],
+                  emails,
+                  widths_cm=[4.5, 5.5, 3.5, 2.0, 4.0, 6.0],
+                  accent_first_col=True)
+
+    # 4.2 shipping address book
+    shipping = data.get("section4_shipping") or []
+    if shipping:
+        add_heading(doc, "4.2 寄样地址簿（Editorial / Content 伙伴）", level=2)
+        add_table(doc,
+                  ["Publisher", "联系人", "Email", "收件地址", "请求 SKU", "数量", "截止"],
+                  shipping,
+                  widths_cm=[3.2, 2.8, 4.0, 7.5, 3.5, 1.5, 2.2],
+                  accent_first_col=True,
+                  header_size=9, body_size=8)
+        add_para(doc,
+                 "💡 操作提示：品牌仓库按『Publisher → 联系人』索引，逐条打包寄出；每单寄出后请在本表状态列标注 tracking 号并回填至 affiliate@celldigital.co。",
+                 size=9, italic=True, color=GREY)
+
+    # 4.3 paid placement / contracts
+    contracts = data.get("section4_contracts") or []
+    if contracts:
+        add_heading(doc, "4.3 Paid Placement / 合同索引", level=2)
+        add_table(doc,
+                  ["Publisher", "联系人", "合同 / IO 文件", "类型", "签署 / 最新", "金额 (USD)", "附件路径"],
+                  contracts,
+                  widths_cm=[3.2, 2.8, 5.0, 2.5, 2.5, 2.5, 6.2],
+                  accent_first_col=True,
+                  header_size=9, body_size=8)
+        add_para(doc,
+                 "💡 合同附件已存入 GitHub 私有仓 reports/{date}/attachments/；品牌法务 / 财务可凭 SSO 直接下载。",
+                 size=9, italic=True, color=GREY)
+
+    # 4.4 TODO
+    add_heading(doc, "4.4 拆解后的 TODO 清单（按优先级）", level=2)
     add_table(doc,
               ["优先级", "任务", "Owner", "Deadline", "前置条件", "预期影响"],
               data["section4_todo"],
-              widths_cm=[2.5, 6.0, 3.5, 2.5, 5.5, 5.5],
-              accent_first_col=True)
+              widths_cm=[2.0, 6.0, 3.5, 2.5, 5.5, 6.2],
+              accent_first_col=True,
+              header_size=9, body_size=8)
 
-    add_heading(doc, "4.3 配套素材 / 文件需求（PDF / PPT / 图库）", level=2)
+    # 4.5 assets
+    add_heading(doc, "4.5 配套素材 / 文件需求", level=2)
     assets = data["section4_assets"]
     add_table(doc, assets[0], assets[1:],
-              widths_cm=[6.5, 5.0, 8.5, 5.5],
-              accent_first_col=True)
+              widths_cm=[6.5, 4.0, 8.5, 6.7],
+              accent_first_col=True,
+              header_size=9, body_size=8)
 
     add_diagnosis(doc,
-                  "Publisher 请求高度集中于三类资产：(1) Awin 产品 feed（Geizhals/Coupons.de/Idealo 必需）、"
-                  "(2) 高分辨率品牌素材包（HBR/Echowise/vatago.de/Golden Shopping Days 通用）、"
-                  "(3) 季度 Coupon 计划（DACH 优惠码站急需）。"
-                  "三类素材任一缺失都将直接卡住 €3,000+/月 EU GMV 增量。"
-                  "建议：本周内先解锁产品 feed + 素材包两项，下周完成 Coupon 月历与 Bidding Policy 起草。",
+                  "邮件情报三类主诉求：(1) BuzzFeed / Jeweler's Blog 等 Editorial 伙伴要求寄样 — 直接影响首篇内容排期；"
+                  "(2) RetailMeNot / Slickdeals 等 Coupon 伙伴提出 Paid Placement / 首屏位采购 — 需品牌侧预算审批；"
+                  "(3) 所有新伙伴要求品牌素材包 + 最新 Coupon 月历。"
+                  "建议品牌团队本周内完成：① 按 4.2 寄样地址簿执行 5 单打包发货；② 对 4.3 Paid Placement 清单逐一核算 ROI 并回复。",
                   width_cm=LANDSCAPE_WIDTH_CM)
 
 
@@ -716,28 +871,70 @@ def build_html(data, out_path, embed_images=True):
     # Section 4
     parts.append('<section class="section">')
     parts.append("<h2>四、Publisher 合作请求邮件追溯（过去 30 天）</h2>")
-    parts.append('<p class="lede">本节基于联盟营销邮箱过去 30 天往来邮件梳理，共识别出 9 个与 OUFER JEWELRY 直接相关的'
-                 'Publisher 合作 / Integration / Collaboration 请求，并据此拆解为 10 项可执行 TODO 与'
-                 '8 项配套素材文件需求。'
-                 '为保护合作伙伴隐私，本节已脱敏处理 — 不外露 Publisher 联系邮箱；如需联络方式请向'
-                 '联盟营销绩效办公室申请内部清单。</p>')
-    parts.append("<h3>4.1 合作请求邮件清单（脱敏版）</h3>")
-    parts.append(_html_table(
-        ["Publisher", "邮件主题", "合作类型", "最后往来", "当前状态", "请求素材 / 资料"],
-        s["section4_emails"], accent_first_col=True))
-    parts.append("<h3>4.2 拆解后的 TODO 清单（按优先级）</h3>")
+    intel = s.get("_email_intel") or {}
+    _total = intel.get("thread_count_total")
+    _relevant = intel.get("thread_count_relevant", len(s.get("section4_emails", [])))
+    parts.append(
+        f'<p class="lede">本节基于品牌方联盟营销邮箱（affiliate@celldigital.co）过去 30 天往来邮件梳理。'
+        f'共扫描 {_total if _total is not None else "—"} 个邮件线程，识别出 {_relevant} 个与 OUFER JEWELRY 直接相关的合作线程，'
+        f'按 4 类情报（寄样 / Paid Placement / 素材 / Onboarding）拆解。'
+        f'本报告定向派送至品牌侧联盟营销运营团队（SSO 门控），保留 Publisher 真实联系人与邮箱以便品牌团队直接执行寄样、签约、对公打款等动作。</p>'
+    )
+    parts.append("<h3>4.1 合作请求邮件总览</h3>")
+    emails = s.get("section4_emails", [])
+    if emails and len(emails[0]) == 8:
+        parts.append(_html_table(
+            ["Publisher", "联系人", "Email", "邮件主题", "类型", "最后往来", "状态", "附件"],
+            emails, accent_first_col=True))
+    else:
+        parts.append(_html_table(
+            ["Publisher", "邮件主题", "合作类型", "最后往来", "当前状态", "请求素材 / 资料"],
+            emails, accent_first_col=True))
+
+    shipping = s.get("section4_shipping") or []
+    if shipping:
+        parts.append("<h3>4.2 寄样地址簿（Editorial / Content 伙伴）</h3>")
+        parts.append(_html_table(
+            ["Publisher", "联系人", "Email", "收件地址", "请求 SKU", "数量", "截止"],
+            shipping, accent_first_col=True))
+        parts.append('<p class="lede" style="font-size:12px;font-style:italic;">💡 品牌仓库按『Publisher → 联系人』索引逐条打包寄出；每单寄出后在 affiliate@celldigital.co 回填 tracking 号。</p>')
+
+    contracts = s.get("section4_contracts") or []
+    if contracts:
+        parts.append("<h3>4.3 Paid Placement / 合同索引</h3>")
+        # Render with hyperlink on the last column (attachment path)
+        hdrs = ["Publisher", "联系人", "合同 / IO 文件", "类型", "签署 / 最新", "金额 (USD)", "附件链接"]
+        out = ['<table class="data">']
+        out.append("<thead><tr>" + "".join(f"<th>{_esc(h)}</th>" for h in hdrs) + "</tr></thead><tbody>")
+        for row in contracts:
+            pub, contact, doc_name, doc_type, signed, value, link = row
+            link_cell = f'<a href="{_esc(link)}">{_esc(doc_name)}</a>' if link and link != "—" else _esc(link)
+            cells = [
+                f'<td class="first">{_esc(pub)}</td>',
+                f'<td>{_esc(contact)}</td>',
+                f'<td>{_esc(doc_name)}</td>',
+                f'<td>{_esc(doc_type)}</td>',
+                f'<td>{_esc(signed)}</td>',
+                f'<td>{_esc(value)}</td>',
+                f'<td>{link_cell}</td>',
+            ]
+            out.append("<tr>" + "".join(cells) + "</tr>")
+        out.append("</tbody></table>")
+        parts.append("\n".join(out))
+        parts.append('<p class="lede" style="font-size:12px;font-style:italic;">💡 合同附件已存入 GitHub 私有仓 <code>reports/{date}/attachments/</code>；品牌法务 / 财务凭 SSO 直接下载。</p>')
+
+    parts.append("<h3>4.4 拆解后的 TODO 清单（按优先级）</h3>")
     parts.append(_html_table(
         ["优先级", "任务", "Owner", "Deadline", "前置条件", "预期影响"],
         s["section4_todo"], accent_first_col=True))
-    parts.append("<h3>4.3 配套素材 / 文件需求（PDF / PPT / 图库）</h3>")
+    parts.append("<h3>4.5 配套素材 / 文件需求</h3>")
     assets = s["section4_assets"]
     parts.append(_html_table(assets[0], assets[1:], accent_first_col=True))
     parts.append(_html_diagnosis(
-        "Publisher 请求高度集中于三类资产：(1) Awin 产品 feed（Geizhals/Coupons.de/Idealo 必需）、"
-        "(2) 高分辨率品牌素材包（HBR/Echowise/vatago.de/Golden Shopping Days 通用）、"
-        "(3) 季度 Coupon 计划（DACH 优惠码站急需）。"
-        "三类素材任一缺失都将直接卡住 €3,000+/月 EU GMV 增量。"
-        "建议：本周内先解锁产品 feed + 素材包两项，下周完成 Coupon 月历与 Bidding Policy 起草。"))
+        "邮件情报三类主诉求：(1) BuzzFeed / Jeweler's Blog 等 Editorial 伙伴要求寄样 — 直接影响首篇内容排期；"
+        "(2) RetailMeNot / Slickdeals 等 Coupon 伙伴提出 Paid Placement / 首屏位采购 — 需品牌侧预算审批；"
+        "(3) 所有新伙伴要求品牌素材包 + 最新 Coupon 月历。"
+        "建议品牌团队本周内完成：① 按 4.2 寄样地址簿执行 5 单打包发货；② 对 4.3 Paid Placement 清单逐一核算 ROI 并回复。"))
     parts.append("</section>")
 
     # Section 5
@@ -806,7 +1003,9 @@ def build_markdown(data, out_path, screenshot_rel_dir="attachments"):
     parts.append("")
     parts.append("## 一、本期新增 Publisher 列表")
     parts.append("")
-    parts.append(f"过去 30 天 OUFER JEWELRY US 共新增 **{summary['total_count']} 家** Publisher（US {summary['us_count']}）。")
+    _us = summary.get("us_count", 0)
+    _total = summary.get("total_count", _us)
+    parts.append(f"过去 30 天 OUFER JEWELRY US 共新增 **{_total} 家** Publisher（US {_us}）。")
     parts.append("")
     parts.append("### 1.1 Publisher 类型分布")
     parts.append(_md_table(["Publisher 类型", "新增家数", "占比"], summary["by_type"]))
@@ -843,25 +1042,48 @@ def build_markdown(data, out_path, screenshot_rel_dir="attachments"):
     parts.append("")
     parts.append(f"> 🔍 **诊断与建议** — {s['section3_diagnosis']}")
     parts.append("")
-    parts.append("## 四、Publisher 合作请求邮件追溯（过去 30 天，脱敏版）")
+    parts.append("## 四、Publisher 合作请求邮件追溯（过去 30 天）")
     parts.append("")
-    parts.append("> ⚠️ 已脱敏 — 不暴露 Publisher 联系邮箱；如需联络方式请向联盟营销绩效办公室申请内部清单。")
+    parts.append("> 🔒 本报告定向派送至品牌侧联盟营销运营团队（SSO 门控），保留真实联系人 / 邮箱 / 地址以便直接执行寄样、签约、对公打款。")
     parts.append("")
-    parts.append("### 4.1 合作请求邮件清单")
-    parts.append(_md_table(
-        ["Publisher", "邮件主题", "合作类型", "最后往来", "当前状态", "请求素材 / 资料"],
-        s["section4_emails"]))
+    parts.append("### 4.1 合作请求邮件总览")
+    emails = s.get("section4_emails", [])
+    if emails and len(emails[0]) == 8:
+        parts.append(_md_table(
+            ["Publisher", "联系人", "Email", "邮件主题", "类型", "最后往来", "状态", "附件"],
+            emails))
+    else:
+        parts.append(_md_table(
+            ["Publisher", "邮件主题", "合作类型", "最后往来", "当前状态", "请求素材 / 资料"],
+            emails))
     parts.append("")
-    parts.append("### 4.2 TODO 清单（按优先级）")
+
+    shipping = s.get("section4_shipping") or []
+    if shipping:
+        parts.append("### 4.2 寄样地址簿（Editorial / Content 伙伴）")
+        parts.append(_md_table(
+            ["Publisher", "联系人", "Email", "收件地址", "请求 SKU", "数量", "截止"],
+            shipping))
+        parts.append("")
+
+    contracts = s.get("section4_contracts") or []
+    if contracts:
+        parts.append("### 4.3 Paid Placement / 合同索引")
+        parts.append(_md_table(
+            ["Publisher", "联系人", "合同 / IO 文件", "类型", "签署 / 最新", "金额 (USD)", "附件路径"],
+            contracts))
+        parts.append("")
+
+    parts.append("### 4.4 TODO 清单（按优先级）")
     parts.append(_md_table(
         ["优先级", "任务", "Owner", "Deadline", "前置条件", "预期影响"],
         s["section4_todo"]))
     parts.append("")
-    parts.append("### 4.3 配套素材 / 文件需求")
+    parts.append("### 4.5 配套素材 / 文件需求")
     assets = s["section4_assets"]
     parts.append(_md_table(assets[0], assets[1:]))
     parts.append("")
-    parts.append("> 🔍 **诊断与建议** — Publisher 请求集中于三类资产：(1) Awin 产品 feed、(2) 高分辨率品牌素材包、(3) 季度 Coupon 计划。三类任一缺失都将卡住 €3,000+/月 EU GMV 增量。本周先解锁 feed + 素材包，下周完成 Coupon 月历与 Bidding Policy。")
+    parts.append("> 🔍 **诊断与建议** — 邮件情报三类主诉求：Editorial 寄样、Paid Placement 预算审批、品牌素材包 + Coupon 月历。本周内按 4.2 执行 5 单寄样，按 4.3 核算 Paid Placement ROI。")
     parts.append("")
     parts.append("## 五、品牌侧需要协助的事项")
     parts.append("")
@@ -890,6 +1112,10 @@ def main():
     parser.add_argument("--obsidian-dir", default=None,
                         help="Optional: also write Markdown + attachments to Obsidian vault folder")
     parser.add_argument("--skip-pdf", action="store_true")
+    parser.add_argument("--email-intel", default=None,
+                        help="Optional: path to oufer_email_intel.json produced by Gmail MCP scrape")
+    parser.add_argument("--scrub", action="store_true",
+                        help="Mask Publisher emails. OFF by default — this report is brand-ops internal (SSO-walled).")
     args = parser.parse_args()
 
     data_path = Path(args.data).expanduser()
@@ -899,8 +1125,12 @@ def main():
     with data_path.open("r", encoding="utf-8") as f:
         raw_data = json.load(f)
 
-    # PRIVACY: scrub once, all renderers consume scrubbed copy
-    data = scrub_emails(raw_data)
+    # 1. Merge Gmail intel (no-op if file missing)
+    if args.email_intel:
+        raw_data = merge_email_intel(raw_data, args.email_intel)
+
+    # 2. Optional privacy scrub (public-audience only)
+    data = scrub_emails(raw_data) if args.scrub else raw_data
 
     base = f"Oufer-简化周报-{args.date}"
     docx_path = out_dir / f"{base}.docx"
